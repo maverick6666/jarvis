@@ -1,0 +1,218 @@
+"""Subject classification — list existing subjects + link turns to subjects.
+
+The new vision flow:
+  1. AI calls /subjects to see what already exists in this workspace
+  2. AI proposes subject assignments to user (in chat)
+  3. User confirms / edits
+  4. AI calls /classify-turns with final assignments → server creates new
+     subjects + writes turn_subjects M:N rows.
+
+This module exposes the server-side primitives. The propose/confirm reasoning
+lives in the AI client.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from jarvis.core.entity_resolution import normalize_name
+from jarvis.models.tables import Entity, EntityType, TurnSubject
+
+logger = logging.getLogger(__name__)
+
+
+async def list_subjects(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    top_level_only: bool = True,
+    include_empty: bool = False,
+) -> list[dict[str, Any]]:
+    """List subjects (entities) with turn counts.
+
+    Subjects are entities that are linked to turns via turn_subjects.
+    By default excludes entities with 0 turn links (these are knowledge_facts
+    entities, not user-facing subjects).
+    """
+    parent_filter = "AND e.parent_id IS NULL" if top_level_only else ""
+    empty_filter = "" if include_empty else "AND COALESCE(tc.cnt, 0) > 0"
+    rows = await db.execute(
+        text(f"""
+            SELECT
+                e.id, e.name, e.parent_id, parent.name AS parent_name,
+                COALESCE(tc.cnt, 0) AS turn_count
+            FROM entities e
+            LEFT JOIN entities parent ON parent.id = e.parent_id
+            LEFT JOIN (
+                SELECT subject_id, COUNT(*) AS cnt
+                FROM turn_subjects
+                WHERE workspace_id = :ws
+                GROUP BY subject_id
+            ) tc ON tc.subject_id = e.id
+            WHERE e.workspace_id = :ws {parent_filter} {empty_filter}
+            ORDER BY turn_count DESC, e.name ASC
+        """),
+        {"ws": str(workspace_id)},
+    )
+    return [
+        {
+            "subject_id": r[0],
+            "name": r[1],
+            "parent_id": r[2],
+            "parent_name": r[3],
+            "turn_count": int(r[4]),
+        }
+        for r in rows.fetchall()
+    ]
+
+
+async def _create_subject(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    name: str,
+    parent_id: uuid.UUID | None,
+) -> Entity:
+    """Create a new subject (entity with parent_id) or return existing match."""
+    normalized = normalize_name(name)
+    existing_q = await db.execute(
+        select(Entity).where(
+            Entity.workspace_id == workspace_id,
+            Entity.name_normalized == normalized,
+        )
+    )
+    existing = existing_q.scalar_one_or_none()
+    if existing:
+        # Update parent if missing (do not overwrite if already set)
+        if parent_id and existing.parent_id is None:
+            existing.parent_id = parent_id
+        return existing
+
+    ent = Entity(
+        workspace_id=workspace_id,
+        name=name,
+        name_normalized=normalized,
+        entity_type=EntityType.concept,
+        parent_id=parent_id,
+    )
+    db.add(ent)
+    await db.flush()
+    return ent
+
+
+async def _link_turns(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    subject_id: uuid.UUID,
+    turn_ids: list[uuid.UUID],
+) -> tuple[int, int]:
+    """Insert turn_subjects rows. Returns (linked, skipped_duplicate)."""
+    if not turn_ids:
+        return 0, 0
+
+    rows = [
+        {"turn_id": str(t), "subject_id": str(subject_id), "workspace_id": str(workspace_id)}
+        for t in turn_ids
+    ]
+
+    # Use raw SQL with ON CONFLICT to skip duplicates cleanly.
+    result = await db.execute(
+        text("""
+            INSERT INTO turn_subjects (turn_id, subject_id, workspace_id)
+            SELECT (r->>'turn_id')::uuid, (r->>'subject_id')::uuid, (r->>'workspace_id')::uuid
+            FROM jsonb_array_elements(CAST(:rows AS jsonb)) AS r
+            ON CONFLICT (turn_id, subject_id) DO NOTHING
+            RETURNING turn_id
+        """),
+        {"rows": __import__("json").dumps(rows)},
+    )
+    linked = len(result.fetchall())
+    skipped = len(turn_ids) - linked
+    return linked, skipped
+
+
+async def classify_turns(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    existing_links: list[dict[str, Any]],
+    new_subjects: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Apply confirmed subject assignments.
+
+    existing_links: [{'subject_id': UUID, 'turn_ids': [UUID, ...]}, ...]
+    new_subjects: [{
+        'name': str,
+        'parent_id': UUID | None,           # explicit parent id
+        'parent_name': str | None,          # OR parent by name (resolved at apply time)
+        'turn_ids': [UUID, ...]
+    }, ...]
+
+    new_subjects are processed in two passes:
+      1. Items with no parent (top-level) — created first
+      2. Items with a parent_name pointing to an item from pass 1 — resolved
+    """
+    created = 0
+    total_linked = 0
+    total_skipped = 0
+
+    for spec in existing_links:
+        subj_id = uuid.UUID(str(spec["subject_id"]))
+        turn_ids = [uuid.UUID(str(t)) for t in spec.get("turn_ids", [])]
+        linked, skipped = await _link_turns(db, workspace_id, subj_id, turn_ids)
+        total_linked += linked
+        total_skipped += skipped
+
+    # Pass 1: top-level new subjects (no parent)
+    name_to_id: dict[str, uuid.UUID] = {}
+    for spec in new_subjects:
+        if spec.get("parent_id") or spec.get("parent_name"):
+            continue
+        ent = await _create_subject(db, workspace_id, spec["name"], None)
+        name_to_id[normalize_name(spec["name"])] = ent.id
+        created += 1
+        turn_ids = [uuid.UUID(str(t)) for t in spec.get("turn_ids", [])]
+        linked, skipped = await _link_turns(db, workspace_id, ent.id, turn_ids)
+        total_linked += linked
+        total_skipped += skipped
+
+    await db.flush()
+
+    # Pass 2: subjects with parent (resolved via parent_id explicit or parent_name)
+    for spec in new_subjects:
+        parent_id_raw = spec.get("parent_id")
+        parent_name = spec.get("parent_name")
+        if not parent_id_raw and not parent_name:
+            continue
+        parent_uuid: uuid.UUID | None = None
+        if parent_id_raw:
+            parent_uuid = uuid.UUID(str(parent_id_raw))
+        elif parent_name:
+            norm = normalize_name(parent_name)
+            if norm in name_to_id:
+                parent_uuid = name_to_id[norm]
+            else:
+                # Lookup in DB
+                result = await db.execute(
+                    select(Entity).where(
+                        Entity.workspace_id == workspace_id,
+                        Entity.name_normalized == norm,
+                    )
+                )
+                exist = result.scalar_one_or_none()
+                if exist:
+                    parent_uuid = exist.id
+        ent = await _create_subject(db, workspace_id, spec["name"], parent_uuid)
+        created += 1
+        turn_ids = [uuid.UUID(str(t)) for t in spec.get("turn_ids", [])]
+        linked, skipped = await _link_turns(db, workspace_id, ent.id, turn_ids)
+        total_linked += linked
+        total_skipped += skipped
+
+    return {
+        "created_subjects": created,
+        "linked_turns": total_linked,
+        "skipped_duplicate_links": total_skipped,
+    }
